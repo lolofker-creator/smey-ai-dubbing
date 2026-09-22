@@ -895,6 +895,7 @@ if uploaded and st.button(
 
 
         # =================================================
+                # =================================================
         # 7. Replace original audio
         # =================================================
 
@@ -902,52 +903,45 @@ if uploaded and st.button(
             "6️⃣ កំពុងបង្កើតវីដេអូ MP4..."
         )
 
-
         try:
-
             subprocess.run(
-
                 [
                     ffmpeg,
                     "-y",
-
                     "-i",
                     str(video),
-
                     "-i",
                     str(mixed_audio),
-
                     "-map",
                     "0:v:0",
-
                     "-map",
                     "1:a:0",
-
                     "-c:v",
                     "copy",
-
                     "-c:a",
                     "aac",
-
                     "-b:a",
                     "192k",
-
                     "-t",
                     str(video_duration),
-
                     "-movflags",
                     "+faststart",
-
                     str(output)
                 ],
-
                 check=True,
-
                 stdout=subprocess.DEVNULL,
-
                 stderr=subprocess.PIPE
             )
-            
+
+        except Exception as e:
+            st.error(
+                "មិនអាចបង្កើត MP4 បានទេ។"
+            )
+            st.code(
+                f"{type(e).__name__}: {str(e)}"
+            )
+            st.stop()
+
         # =================================================
         # Finished
         # =================================================
@@ -967,5 +961,3 @@ if uploaded and st.button(
             "video/mp4",
             use_container_width=True
         )
-
-      
