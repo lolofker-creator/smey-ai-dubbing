@@ -1,5 +1,6 @@
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import requests
@@ -59,9 +60,9 @@ if uploaded and st.button(
 
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
 
-        # -----------------------------
-        # 1. ស្តាប់សំឡេងចិន
-        # -----------------------------
+        # =========================
+        # 1. Extract audio
+        # =========================
 
         st.write("1️⃣ កំពុងស្តាប់សំឡេងចិន...")
 
@@ -90,93 +91,128 @@ if uploaded and st.button(
             config={"mime_type": "audio/mpeg"}
         )
 
-        interaction = client.interactions.create(
-            model="gemini-3.5-transcribe",
-            input=[
-                {
-                    "type": "audio",
-                    "uri": audio_file.uri,
-                    "mime_type": audio_file.mime_type
-                }
-            ],
-            generation_config={
-                "transcription_config": {
-                    "language_codes": ["zh-CN"],
-                    "mode": {
-                        "type": "verbatim"
-                    }
-                }
-            }
-        )
+        # =========================
+        # 2. Chinese transcription
+        # =========================
 
-        chinese = (interaction.output_text or "").strip()
-
-        if not chinese:
-            st.error("មិនរកឃើញសំឡេងនិយាយ")
-            st.stop()
-
-        # -----------------------------
-        # 2. បកប្រែចិន → ខ្មែរ
-        # -----------------------------
-
-        st.write("2️⃣ កំពុងបកប្រែជាខ្មែរ...")
-
-        models = [
+        transcription_models = [
             "gemini-3.8-flash",
             "gemini-3.7-flash",
             "gemini-3.6-flash",
             "gemini-3.5-flash",
         ]
 
-        response = None
+        chinese = ""
 
-        for model_name in models:
+        for model_name in transcription_models:
 
-            try:
+            for attempt in range(2):
 
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=(
-                        "Translate this spoken Chinese into "
-                        "natural conversational Khmer. "
-                        "Return only Khmer translation.\n\n"
-                        f"{chinese}"
-                    ),
-                    config=types.GenerateContentConfig(
-                        temperature=0.2
+                try:
+
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=[
+                            (
+                                "Listen to this audio carefully. "
+                                "Transcribe ONLY the spoken Chinese words. "
+                                "Do not translate. "
+                                "Return only the Chinese transcript."
+                            ),
+                            audio_file
+                        ],
+                        config=types.GenerateContentConfig(
+                            temperature=0.1
+                        )
                     )
-                )
 
-                if response and response.text:
-                    break
+                    chinese = (response.text or "").strip()
 
-            except Exception:
-                response = None
-                continue
+                    if chinese:
+                        break
 
-        if response is None or not response.text:
+                except Exception:
+                    if attempt == 0:
+                        time.sleep(5)
+                    else:
+                        continue
+
+            if chinese:
+                break
+
+        if not chinese:
+            st.error(
+                "Gemini មិនអាចស្តាប់សំឡេងចិនបាននៅពេលនេះ។ "
+                "សូមសាកម្តងទៀតក្រោយបន្តិច។"
+            )
+            st.stop()
+
+        # =========================
+        # 3. Translate Chinese → Khmer
+        # =========================
+
+        st.write("2️⃣ កំពុងបកប្រែជាខ្មែរ...")
+
+        translation_models = [
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+        ]
+
+        khmer = ""
+
+        for model_name in translation_models:
+
+            for attempt in range(2):
+
+                try:
+
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=(
+                            "Translate this spoken Chinese into "
+                            "natural conversational Khmer. "
+                            "Keep the original meaning and tone. "
+                            "Return ONLY Khmer translation.\n\n"
+                            f"{chinese}"
+                        ),
+                        config=types.GenerateContentConfig(
+                            temperature=0.2
+                        )
+                    )
+
+                    khmer = (response.text or "").strip()
+
+                    if khmer:
+                        break
+
+                except Exception:
+                    if attempt == 0:
+                        time.sleep(5)
+                    else:
+                        continue
+
+            if khmer:
+                break
+
+        if not khmer:
             st.error(
                 "Gemini មិនអាចបកប្រែបាននៅពេលនេះ។ "
                 "សូមសាកម្តងទៀត។"
             )
             st.stop()
 
-        khmer = (response.text or "").strip()
-
-        if not khmer:
-            st.error("បកប្រែមិនបាន")
-            st.stop()
-
         if len(khmer) > 1200:
             st.error(
                 "អត្ថបទខ្មែរលើស 1200 តួអក្សរ។ "
-                "ជំហាននេះត្រូវបែងចែកជាផ្នែកសិន។"
+                "វីដេអូវែងត្រូវបែងចែកជាផ្នែកសិន។"
             )
             st.stop()
 
-        # -----------------------------
-        # 3. បង្កើតសំឡេង AI ខ្មែរ
-        # -----------------------------
+        # =========================
+        # 4. Khmer AI Voice
+        # =========================
 
         st.write("3️⃣ កំពុងបង្កើតសំឡេង AI ខ្មែរ...")
 
@@ -201,9 +237,9 @@ if uploaded and st.button(
 
         khmer_audio.write_bytes(r.content)
 
-        # -----------------------------
-        # 4. ដាក់សំឡេងខ្មែរចូលវីដេអូ
-        # -----------------------------
+        # =========================
+        # 5. Replace video audio
+        # =========================
 
         st.write("4️⃣ កំពុងដាក់សំឡេងខ្មែរចូលវីដេអូ...")
 
@@ -235,9 +271,9 @@ if uploaded and st.button(
             stderr=subprocess.PIPE
         )
 
-        # -----------------------------
-        # រួចរាល់
-        # -----------------------------
+        # =========================
+        # Finished
+        # =========================
 
         st.success(
             "🎉 រួចរាល់! វីដេអូមានសំឡេងខ្មែរ AI"
