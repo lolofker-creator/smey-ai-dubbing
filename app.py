@@ -1,7 +1,8 @@
+import json
+import re
 import subprocess
 import tempfile
 import time
-import re
 from pathlib import Path
 
 import requests
@@ -17,13 +18,17 @@ st.set_page_config(
 )
 
 st.title("🎙️ Smey AI Dubbing")
-st.caption("វីដេអូចិន → បកប្រែខ្មែរ → សំឡេងខ្មែរ តាមពេលនិយាយ → MP4")
+st.caption(
+    "វីដេអូចិន → ស្តាប់សំឡេង → បកប្រែខ្មែរ → "
+    "សំឡេងខ្មែរ → MP4"
+)
 
 
 uploaded = st.file_uploader(
     "🎥 ជ្រើសវីដេអូ",
     type=["mp4", "mov", "mkv", "webm", "avi"]
 )
+
 
 voice_label = st.selectbox(
     "🎙️ ជ្រើសសំឡេងខ្មែរ",
@@ -34,129 +39,103 @@ voice = "sovann" if voice_label == "Sovann" else "puthi"
 
 
 # =========================================================
-# Convert Gemini timestamp values to seconds
+# Get media duration
 # =========================================================
 
-def get_seconds(value):
+def get_duration(ffmpeg, file_path):
 
-    if value is None:
+    result = subprocess.run(
+        [
+            ffmpeg,
+            "-i",
+            str(file_path)
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    match = re.search(
+        r"Duration:\s*(\d+):(\d+):([\d.]+)",
+        result.stderr
+    )
+
+    if not match:
         return 0.0
+
+    hours = int(match.group(1))
+    minutes = int(match.group(2))
+    seconds = float(match.group(3))
+
+    return (
+        hours * 3600
+        + minutes * 60
+        + seconds
+    )
+
+
+# =========================================================
+# Convert timestamp safely
+# =========================================================
+
+def parse_time(value):
 
     if isinstance(value, (int, float)):
         return float(value)
 
     text = str(value).strip()
 
-    if text.endswith("ms"):
-        return float(text[:-2]) / 1000
+    if not text:
+        return 0.0
 
-    if text.endswith("s"):
-        return float(text[:-1])
-
+    # Seconds
     try:
         return float(text)
     except Exception:
-        return 0.0
+        pass
 
+    # MM:SS
+    parts = text.split(":")
 
-# =========================================================
-# Get word timestamps from Gemini
-# =========================================================
-
-def get_word_annotations(interaction):
-
-    words = []
-
-    for step in getattr(interaction, "steps", []) or []:
-
-        for content in getattr(step, "content", []) or []:
-
-            for annotation in getattr(
-                content,
-                "annotations",
-                []
-            ) or []:
-
-                if getattr(
-                    annotation,
-                    "type",
-                    None
-                ) == "word_info":
-
-                    words.append(annotation)
-
-    return words
-
-
-# =========================================================
-# Group words into small speaking segments
-# =========================================================
-
-def make_segments(words, max_words=8):
-
-    segments = []
-
-    current_text = []
-    current_start = None
-    current_end = None
-
-    for word in words:
-
-        text = str(
-            getattr(word, "text", "")
-        ).strip()
-
-        if not text:
-            continue
-
-        start = get_seconds(
-            getattr(
-                word,
-                "start_offset",
-                0
+    try:
+        if len(parts) == 2:
+            return (
+                float(parts[0]) * 60
+                + float(parts[1])
             )
-        )
 
-        end = get_seconds(
-            getattr(
-                word,
-                "end_offset",
-                0
+        if len(parts) == 3:
+            return (
+                float(parts[0]) * 3600
+                + float(parts[1]) * 60
+                + float(parts[2])
             )
-        )
 
-        if current_start is None:
-            current_start = start
+    except Exception:
+        pass
 
-        current_text.append(text)
-        current_end = end
+    return 0.0
 
-        if (
-            len(current_text) >= max_words
-            or text.endswith(
-                ("。", "！", "？", ".", "!", "?")
-            )
-        ):
 
-            segments.append({
-                "text": " ".join(current_text),
-                "start": current_start,
-                "end": current_end
-            })
+# =========================================================
+# Make atempo filter
+# =========================================================
 
-            current_text = []
-            current_start = None
-            current_end = None
+def make_atempo_filter(speed):
 
-    if current_text:
+    filters = []
 
-        segments.append({
-            "text": " ".join(current_text),
-            "start": current_start,
-            "end": current_end
-        })
+    while speed < 0.5:
+        filters.append("atempo=0.5")
+        speed /= 0.5
 
-    return segments
+    while speed > 2.0:
+        filters.append("atempo=2.0")
+        speed /= 2.0
+
+    filters.append(f"atempo={speed:.6f}")
+
+    return ",".join(filters)
 
 
 # =========================================================
@@ -182,7 +161,8 @@ if uploaded and st.button(
     if not gemini_key or not doslarb_key:
 
         st.error(
-            "សូមដាក់ GEMINI_API_KEY និង DOSLARB_API_KEY ក្នុង Streamlit Secrets"
+            "សូមដាក់ GEMINI_API_KEY និង DOSLARB_API_KEY "
+            "ក្នុង Streamlit Secrets"
         )
 
         st.stop()
@@ -238,12 +218,25 @@ if uploaded and st.button(
             )
 
             st.code(str(e))
+            st.stop()
+
+
+        video_duration = get_duration(
+            ffmpeg,
+            video
+        )
+
+        if video_duration <= 0:
+
+            st.error(
+                "មិនអាចរកប្រវែងវីដេអូបានទេ។"
+            )
 
             st.stop()
 
 
         # =================================================
-        # Gemini client
+        # Gemini
         # =================================================
 
         try:
@@ -259,7 +252,6 @@ if uploaded and st.button(
             )
 
             st.code(str(e))
-
             st.stop()
 
 
@@ -290,45 +282,106 @@ if uploaded and st.button(
 
 
         # =================================================
-        # 2. Transcribe with word timestamps
+        # 2. Gemini 3.8 Flash transcription + timestamps
         # =================================================
 
-        interaction = None
+        st.write(
+            "🎧 Gemini កំពុងស្តាប់ និងរកពេលនិយាយ..."
+        )
+
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "segments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "start": {
+                                "type": "number"
+                            },
+                            "end": {
+                                "type": "number"
+                            },
+                            "text": {
+                                "type": "string"
+                            }
+                        },
+                        "required": [
+                            "start",
+                            "end",
+                            "text"
+                        ]
+                    }
+                }
+            },
+            "required": [
+                "segments"
+            ]
+        }
+
+
+        transcript = None
+
 
         for attempt in range(3):
 
             try:
 
-                interaction = client.interactions.create(
-                    model="gemini-3.5-transcribe",
+                response = client.models.generate_content(
 
-                    input=[
-                        {
-                            "type": "audio",
-                            "uri": audio_file.uri,
-                            "mime_type": audio_file.mime_type,
-                        }
+                    model="gemini-3.8-flash",
+
+                    contents=[
+                        (
+                            "Listen carefully to this Chinese audio. "
+                            "Create a transcript divided into speaking "
+                            "segments. For every segment provide:\n"
+                            "1. start = exact approximate start time "
+                            "in seconds\n"
+                            "2. end = exact approximate end time "
+                            "in seconds\n"
+                            "3. text = only the spoken Chinese words\n\n"
+                            "Do not translate.\n"
+                            "Do not invent speech.\n"
+                            "Do not include silence.\n"
+                            "Keep segments short, normally 2 to 8 "
+                            "spoken words.\n"
+                            "Times must be between 0 and the audio "
+                            "duration."
+                        ),
+                        audio_file
                     ],
 
-                    generation_config={
-                        "transcription_config": {
+                    config=types.GenerateContentConfig(
 
-                            "language_codes": [
-                                "cmn-Hans-CN"
-                            ],
+                        temperature=0.1,
 
-                            "mode": {
-                                "type": "verbatim",
+                        response_mime_type="application/json",
 
-                                "timestamp_granularities": [
-                                    "word"
-                                ]
-                            }
-                        }
-                    }
+                        response_schema=schema
+                    )
+                )
+
+
+                raw = (
+                    response.text or ""
+                ).strip()
+
+
+                if not raw:
+                    raise ValueError(
+                        "Gemini returned empty response"
+                    )
+
+
+                transcript = json.loads(
+                    raw
                 )
 
                 break
+
 
             except Exception as e:
 
@@ -339,7 +392,7 @@ if uploaded and st.button(
                 else:
 
                     st.error(
-                        "Gemini មានបញ្ហាពេលស្តាប់សំឡេង។"
+                        "Gemini មិនអាចស្តាប់សំឡេងបាន។"
                     )
 
                     st.code(
@@ -350,73 +403,109 @@ if uploaded and st.button(
 
 
         # =================================================
-        # Get words
+        # Check segments
         # =================================================
 
-        words = get_word_annotations(
-            interaction
+        segments = (
+            transcript.get(
+                "segments",
+                []
+            )
         )
 
-        if not words:
 
-            st.error(
-                "Gemini មិនបានផ្តល់ timestamp សម្រាប់ពាក្យទេ។"
-            )
+        clean_segments = []
+
+
+        for item in segments:
 
             try:
 
-                st.code(
-                    interaction.output_text
+                text = str(
+                    item.get(
+                        "text",
+                        ""
+                    )
+                ).strip()
+
+                start = parse_time(
+                    item.get(
+                        "start",
+                        0
+                    )
                 )
 
+                end = parse_time(
+                    item.get(
+                        "end",
+                        0
+                    )
+                )
+
+
+                if not text:
+                    continue
+
+                if end <= start:
+                    continue
+
+                if start < 0:
+                    start = 0
+
+                if end > video_duration:
+                    end = video_duration
+
+                if end <= start:
+                    continue
+
+
+                clean_segments.append({
+                    "text": text,
+                    "start": start,
+                    "end": end
+                })
+
+
             except Exception:
-                pass
-
-            st.stop()
+                continue
 
 
-        # =================================================
-        # Create segments
-        # =================================================
-
-        segments = make_segments(
-            words,
-            max_words=8
-        )
-
-        if not segments:
+        if not clean_segments:
 
             st.error(
-                "រកមិនឃើញការនិយាយក្នុងវីដេអូ។"
+                "Gemini មិនបានរកឃើញផ្នែកនិយាយទេ។"
             )
 
             st.stop()
 
 
-        st.write(
-            f"រកឃើញការនិយាយចំនួន {len(segments)} ផ្នែក"
+        st.success(
+            f"រកឃើញការនិយាយ {len(clean_segments)} ផ្នែក"
         )
 
 
         # =================================================
-        # 3. Translate Chinese → Khmer
+        # 3. Translate each segment
         # =================================================
 
         st.write(
-            "2️⃣ កំពុងបកប្រែជាខ្មែរ តាមផ្នែក..."
+            "2️⃣ កំពុងបកប្រែជាខ្មែរ..."
         )
+
 
         translated_segments = []
 
 
-        for index, segment in enumerate(segments):
+        for index, segment in enumerate(
+            clean_segments
+        ):
 
             chinese = segment["text"]
 
             khmer = ""
 
 
-            translation_models = [
+            models = [
                 "gemini-3.8-flash",
                 "gemini-3.7-flash",
                 "gemini-3.6-flash",
@@ -424,7 +513,7 @@ if uploaded and st.button(
             ]
 
 
-            for model_name in translation_models:
+            for model_name in models:
 
                 for attempt in range(2):
 
@@ -436,19 +525,20 @@ if uploaded and st.button(
 
                             contents=(
                                 "Translate this spoken Chinese "
-                                "into natural conversational Khmer. "
-                                "Keep the meaning and emotion. "
-                                "Keep the Khmer sentence short enough "
-                                "to fit approximately the original "
-                                "speaking time. "
-                                "Return ONLY Khmer.\n\n"
-                                f"{chinese}"
+                                "into natural conversational Khmer.\n\n"
+                                "Keep the same meaning and emotion.\n"
+                                "Keep the Khmer wording concise so "
+                                "it can fit the original speaking "
+                                "duration.\n"
+                                "Return ONLY Khmer text.\n\n"
+                                f"Chinese:\n{chinese}"
                             ),
 
                             config=types.GenerateContentConfig(
                                 temperature=0.2
                             )
                         )
+
 
                         khmer = (
                             response.text or ""
@@ -459,15 +549,10 @@ if uploaded and st.button(
                             break
 
 
-                    except Exception as e:
+                    except Exception:
 
                         if attempt == 0:
-
                             time.sleep(5)
-
-                        else:
-
-                            continue
 
 
                 if khmer:
@@ -477,7 +562,8 @@ if uploaded and st.button(
             if not khmer:
 
                 st.error(
-                    f"Gemini មិនអាចបកប្រែផ្នែកទី {index + 1} បានទេ។"
+                    f"មិនអាចបកប្រែផ្នែកទី "
+                    f"{index + 1} បានទេ។"
                 )
 
                 st.stop()
@@ -494,12 +580,13 @@ if uploaded and st.button(
 
 
         # =================================================
-        # 4. Generate Khmer AI voice
+        # 4. Doslarb Khmer voice
         # =================================================
 
         st.write(
             "3️⃣ កំពុងបង្កើតសំឡេង AI ខ្មែរ..."
         )
+
 
         segment_audio_files = []
 
@@ -514,7 +601,8 @@ if uploaded and st.button(
             if len(text) > 1200:
 
                 st.error(
-                    f"ផ្នែកទី {index + 1} លើស 1200 តួអក្សរ។"
+                    f"ផ្នែកទី {index + 1} "
+                    "លើស 1200 តួអក្សរ។"
                 )
 
                 st.stop()
@@ -549,14 +637,14 @@ if uploaded and st.button(
                 )
 
                 st.code(str(e))
-
                 st.stop()
 
 
             if not r.ok:
 
                 st.error(
-                    f"Doslarb TTS error {r.status_code}"
+                    f"Doslarb TTS error "
+                    f"{r.status_code}"
                 )
 
                 st.code(
@@ -580,74 +668,13 @@ if uploaded and st.button(
 
 
         # =================================================
-        # 5. Get video duration
+        # 5. Fit each Khmer voice to original timing
         # =================================================
 
         st.write(
             "4️⃣ កំពុងតម្រឹមសំឡេងខ្មែរតាមពេលនិយាយ..."
         )
 
-
-        probe = subprocess.run(
-
-            [
-                ffmpeg,
-                "-i",
-                str(video)
-            ],
-
-            stdout=subprocess.PIPE,
-
-            stderr=subprocess.PIPE,
-
-            text=True
-        )
-
-
-        match = re.search(
-
-            r"Duration:\s*(\d+):(\d+):([\d.]+)",
-
-            probe.stderr
-        )
-
-
-        if not match:
-
-            st.error(
-                "មិនអាចរកប្រវែងវីដេអូបាន។"
-            )
-
-            st.code(
-                probe.stderr[-2000:]
-            )
-
-            st.stop()
-
-
-        hours = int(
-            match.group(1)
-        )
-
-        minutes = int(
-            match.group(2)
-        )
-
-        seconds = float(
-            match.group(3)
-        )
-
-
-        video_duration = (
-            hours * 3600
-            + minutes * 60
-            + seconds
-        )
-
-
-        # =================================================
-        # 6. Delay each Khmer voice
-        # =================================================
 
         delayed_tracks = []
 
@@ -656,9 +683,62 @@ if uploaded and st.button(
             translated_segments
         ):
 
-            start_ms = int(
-                segment["start"] * 1000
+            start = segment["start"]
+            end = segment["end"]
+
+            target_duration = max(
+                end - start,
+                0.2
             )
+
+
+            original_audio = (
+                segment_audio_files[index]
+            )
+
+
+            # Get generated voice duration
+
+            generated_duration = get_duration(
+                ffmpeg,
+                original_audio
+            )
+
+
+            if generated_duration <= 0:
+
+                st.error(
+                    f"មិនអាចរកប្រវែងសំឡេង "
+                    f"ផ្នែកទី {index + 1} បានទេ។"
+                )
+
+                st.stop()
+
+
+            # If Khmer is longer than original timing,
+            # speed it up so it fits.
+
+            speed = (
+                generated_duration
+                / target_duration
+            )
+
+
+            if speed > 1.02:
+
+                atempo_filter = make_atempo_filter(
+                    speed
+                )
+
+            else:
+
+                atempo_filter = "anull"
+
+
+            start_ms = int(
+                start * 1000
+            )
+
 
             delayed = (
                 td / f"delayed_{index}.wav"
@@ -674,12 +754,13 @@ if uploaded and st.button(
                         "-y",
 
                         "-i",
-                        str(
-                            segment_audio_files[index]
-                        ),
+                        str(original_audio),
 
                         "-af",
-                        f"adelay={start_ms}|{start_ms}",
+                        (
+                            f"{atempo_filter},"
+                            f"adelay={start_ms}|{start_ms}"
+                        ),
 
                         "-ar",
                         "44100",
@@ -697,10 +778,12 @@ if uploaded and st.button(
                     stderr=subprocess.PIPE
                 )
 
+
             except Exception as e:
 
                 st.error(
-                    f"មិនអាចតម្រឹមសំឡេងផ្នែកទី {index + 1} បានទេ។"
+                    f"មិនអាចតម្រឹមសំឡេង "
+                    f"ផ្នែកទី {index + 1} បានទេ។"
                 )
 
                 st.code(str(e))
@@ -714,8 +797,13 @@ if uploaded and st.button(
 
 
         # =================================================
-        # 7. Mix all voices
+        # 6. Mix all voices
         # =================================================
+
+        st.write(
+            "5️⃣ កំពុងបញ្ចូលសំឡេងទាំងអស់..."
+        )
+
 
         mixed_audio = (
             td / "khmer_final.wav"
@@ -723,6 +811,7 @@ if uploaded and st.button(
 
 
         inputs = []
+
 
         for track in delayed_tracks:
 
@@ -733,6 +822,7 @@ if uploaded and st.button(
 
 
         filter_parts = []
+
 
         for i in range(
             len(delayed_tracks)
@@ -749,8 +839,11 @@ if uploaded and st.button(
 
             + f"amix=inputs="
             + str(len(delayed_tracks))
+
             + ":duration=longest:"
+
             + "dropout_transition=0,"
+
             + "volume=1"
         )
 
@@ -787,23 +880,26 @@ if uploaded and st.button(
                 stderr=subprocess.PIPE
             )
 
+
         except Exception as e:
 
             st.error(
-                "មិនអាចបញ្ចូលសំឡេងជាចម្រៀងតែមួយបានទេ។"
+                "មិនអាចបញ្ចូលសំឡេងបានទេ។"
             )
 
-            st.code(str(e))
+            st.code(
+                str(e)
+            )
 
             st.stop()
 
 
         # =================================================
-        # 8. Put Khmer audio into video
+        # 7. Replace original audio
         # =================================================
 
         st.write(
-            "5️⃣ កំពុងបញ្ចូលសំឡេងខ្មែរទៅក្នុងវីដេអូ..."
+            "6️⃣ កំពុងបង្កើតវីដេអូ MP4..."
         )
 
 
@@ -851,36 +947,25 @@ if uploaded and st.button(
 
                 stderr=subprocess.PIPE
             )
-
-        except Exception as e:
-
-            st.error(
-                "មិនអាចបង្កើត MP4 ចុងក្រោយបានទេ។"
-            )
-
-            st.code(str(e))
-
-            st.stop()
-
-
+            
         # =================================================
         # Finished
         # =================================================
 
         st.success(
-            "🎉 រួចរាល់! សំឡេងខ្មែរត្រូវបានតម្រឹមតាមពេលនិយាយ"
+            "🎉 រួចរាល់! សំឡេងខ្មែរត្រូវបានតម្រឹមតាមពេលនិយាយ។"
         )
 
+        st.video(
+            output.read_bytes()
+        )
 
         st.download_button(
-
             "⬇️ ទាញយក MP4",
-
             output.read_bytes(),
-
             "smey_ai_dubbing.mp4",
-
             "video/mp4",
-
             use_container_width=True
-            )
+        )
+
+      
